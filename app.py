@@ -7,15 +7,20 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
 
 import requests
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -34,6 +39,8 @@ class Config:
     freshdesk_domain: str
     freshdesk_api_key: str
     google_chat_webhook_url: str
+    google_service_account_json: str
+    google_drive_folder_id: str
     public_portal_url: str
     customer_portal_id: int | None
     poll_interval_seconds: int
@@ -42,11 +49,17 @@ class Config:
 
     @classmethod
     def from_env(
-        cls, *, require_freshdesk: bool = True, require_chat: bool = True
+        cls,
+        *,
+        require_freshdesk: bool = True,
+        require_chat: bool = True,
+        require_drive: bool = True,
     ) -> "Config":
         domain = os.getenv("FRESHDESK_DOMAIN", "").strip().rstrip("/")
         api_key = os.getenv("FRESHDESK_API_KEY", "").strip()
         webhook = os.getenv("GOOGLE_CHAT_WEBHOOK_URL", "").strip()
+        service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
         portal_url = os.getenv("FRESHDESK_PUBLIC_PORTAL_URL", domain).strip().rstrip("/")
         portal_id_text = os.getenv("FRESHDESK_CUSTOMER_PORTAL_ID", "").strip()
 
@@ -56,6 +69,22 @@ class Config:
             )
         if require_chat and not webhook:
             raise ConfigurationError("GOOGLE_CHAT_WEBHOOK_URL must be configured.")
+        if require_drive and (not service_account_json or not drive_folder_id):
+            raise ConfigurationError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_DRIVE_FOLDER_ID "
+                "must be configured."
+            )
+        if service_account_json:
+            try:
+                service_account_info = json.loads(service_account_json)
+            except json.JSONDecodeError as exc:
+                raise ConfigurationError(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON must contain valid JSON."
+                ) from exc
+            if not isinstance(service_account_info, dict):
+                raise ConfigurationError(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON must contain a JSON object."
+                )
 
         try:
             portal_id = int(portal_id_text) if portal_id_text else None
@@ -71,6 +100,8 @@ class Config:
             freshdesk_domain=domain,
             freshdesk_api_key=api_key,
             google_chat_webhook_url=webhook,
+            google_service_account_json=service_account_json,
+            google_drive_folder_id=drive_folder_id,
             public_portal_url=portal_url,
             customer_portal_id=portal_id,
             poll_interval_seconds=interval,
@@ -89,6 +120,7 @@ class Article:
     title: str
     created_at: str
     url: str
+    updated_at: str = ""
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
@@ -148,6 +180,17 @@ class FreshdeskClient:
                 return items
             page += 1
 
+    def _get_object(self, path: str) -> dict[str, Any]:
+        response = self.session.get(
+            f"{self.config.freshdesk_domain}{path}",
+            timeout=(10, 45),
+        )
+        response.raise_for_status()
+        item = response.json()
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Freshdesk returned a non-object response for {path}.")
+        return item
+
     def _category_is_in_portal(self, category: dict[str, Any]) -> bool:
         portal_id = self.config.customer_portal_id
         if portal_id is None:
@@ -190,12 +233,156 @@ class FreshdeskClient:
                         id=article_id,
                         title=str(raw.get("title") or f"Article {article_id}").strip(),
                         created_at=str(raw.get("created_at") or ""),
+                        updated_at=str(raw.get("updated_at") or ""),
                         url=(
                             f"{self.config.public_portal_url}"
                             f"/support/solutions/articles/{article_id}"
                         ),
                     )
         return list(articles_by_id.values())
+
+    def get_complete_html(self, article: Article) -> str:
+        detail = self._get_object(f"/api/v2/solutions/articles/{article.id}")
+        title = str(detail.get("title") or article.title).strip()
+        article_body = str(detail.get("description") or "")
+        created_at = str(detail.get("created_at") or article.created_at)
+        updated_at = str(detail.get("updated_at") or article.updated_at)
+        safe_title = html.escape(title)
+        safe_url = html.escape(article.url, quote=True)
+        safe_base_url = html.escape(f"{self.config.public_portal_url}/", quote=True)
+        safe_created_at = html.escape(created_at)
+        safe_updated_at = html.escape(updated_at)
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base href="{safe_base_url}">
+  <title>{safe_title}</title>
+  <style>
+    body {{ color: #202124; font: 16px/1.6 Arial, sans-serif; margin: 0; }}
+    main {{ margin: 40px auto; max-width: 960px; padding: 0 24px 48px; }}
+    h1 {{ line-height: 1.25; }}
+    .metadata {{ color: #5f6368; font-size: 13px; margin-bottom: 32px; }}
+    img {{ height: auto; max-width: 100%; }}
+    pre {{ overflow-x: auto; }}
+    table {{ border-collapse: collapse; max-width: 100%; }}
+    td, th {{ border: 1px solid #dadce0; padding: 8px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <article>
+      <h1>{safe_title}</h1>
+      <p class="metadata">
+        Created: {safe_created_at}<br>
+        Updated: {safe_updated_at}<br>
+        Source: <a href="{safe_url}">{safe_url}</a>
+      </p>
+      <div class="article-body">
+{article_body}
+      </div>
+    </article>
+  </main>
+</body>
+</html>
+"""
+
+
+class GoogleDriveUploader:
+    """Uploads complete article HTML files to one shared Google Drive folder."""
+
+    # The full Drive scope is required for a service account to access a folder
+    # that a user shared with it from My Drive.
+    SCOPES = ("https://www.googleapis.com/auth/drive",)
+
+    def __init__(
+        self,
+        service_account_json: str,
+        folder_id: str,
+        *,
+        drive_service: Any | None = None,
+    ):
+        self.folder_id = folder_id
+        if drive_service is not None:
+            self.drive = drive_service
+            return
+        try:
+            service_account_info = json.loads(service_account_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info,
+                scopes=self.SCOPES,
+            )
+        except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            raise ConfigurationError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not a valid service-account key."
+            ) from exc
+        self.drive = build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+    def _existing_file_link(self, article_id: int) -> str | None:
+        query = (
+            f"'{self.folder_id}' in parents and trashed = false and "
+            "appProperties has { key='freshdeskArticleId' and "
+            f"value='{article_id}' }}"
+        )
+        result = (
+            self.drive.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id,webViewLink)",
+                pageSize=1,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        files = result.get("files", [])
+        if not files:
+            return None
+        return str(
+            files[0].get("webViewLink")
+            or f"https://drive.google.com/file/d/{files[0]['id']}/view"
+        )
+
+    @staticmethod
+    def filename(article: Article, uploaded_at: datetime) -> str:
+        safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", article.title)
+        safe_title = re.sub(r"\s+", " ", safe_title).strip(" .") or f"Article {article.id}"
+        timestamp = uploaded_at.astimezone(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_UTC")
+        return f"{safe_title[:120]} - {timestamp}.html"
+
+    def upload_article_html(self, article: Article, complete_html: str) -> str:
+        existing_link = self._existing_file_link(article.id)
+        if existing_link:
+            LOGGER.info("Reusing existing Drive HTML for article %d.", article.id)
+            return existing_link
+
+        filename = self.filename(article, datetime.now(timezone.utc))
+        media = MediaIoBaseUpload(
+            BytesIO(complete_html.encode("utf-8")),
+            mimetype="text/html",
+            resumable=False,
+        )
+        metadata = {
+            "name": filename,
+            "parents": [self.folder_id],
+            "appProperties": {"freshdeskArticleId": str(article.id)},
+        }
+        uploaded = (
+            self.drive.files()
+            .create(
+                body=metadata,
+                media_body=media,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return str(
+            uploaded.get("webViewLink")
+            or f"https://drive.google.com/file/d/{uploaded['id']}/view"
+        )
 
 
 class GoogleChatNotifier:
@@ -204,46 +391,22 @@ class GoogleChatNotifier:
         self.session = session or _http_session()
 
     @staticmethod
-    def payload(article: Article) -> dict[str, Any]:
-        safe_title = html.escape(article.title)
+    def payload(article: Article, html_file_url: str) -> dict[str, Any]:
+        clean_title = (
+            article.title.replace("|", "-").replace("<", "").replace(">", "").strip()
+        )
         return {
-            "text": f"📚 New Freshdesk article published\n{article.title}\n{article.url}",
-            "cardsV2": [
-                {
-                    "cardId": f"freshdesk-article-{article.id}",
-                    "card": {
-                        "header": {
-                            "title": "New Freshdesk article published",
-                            "subtitle": "Customer-facing Knowledge Base",
-                        },
-                        "sections": [
-                            {
-                                "widgets": [
-                                    {"textParagraph": {"text": f"<b>{safe_title}</b>"}},
-                                    {
-                                        "buttonList": {
-                                            "buttons": [
-                                                {
-                                                    "text": "Open article",
-                                                    "onClick": {
-                                                        "openLink": {"url": article.url}
-                                                    },
-                                                }
-                                            ]
-                                        }
-                                    },
-                                ]
-                            }
-                        ],
-                    },
-                }
-            ],
+            "text": (
+                "New Freshdesk article published\n"
+                f"<{article.url}|{clean_title}> · "
+                f"<{html_file_url}|Full article HTML>"
+            )
         }
 
-    def send(self, article: Article) -> None:
+    def send(self, article: Article, html_file_url: str) -> None:
         response = self.session.post(
             self.webhook_url,
-            json=self.payload(article),
+            json=self.payload(article, html_file_url),
             timeout=(10, 30),
         )
         response.raise_for_status()
@@ -283,11 +446,13 @@ class ArticleAlertService:
         self,
         config: Config,
         freshdesk: FreshdeskClient,
+        drive_uploader: GoogleDriveUploader,
         notifier: GoogleChatNotifier,
         state_store: StateStore,
     ):
         self.config = config
         self.freshdesk = freshdesk
+        self.drive_uploader = drive_uploader
         self.notifier = notifier
         self.state_store = state_store
 
@@ -319,7 +484,11 @@ class ArticleAlertService:
             if dry_run:
                 LOGGER.info("DRY RUN alert: %s — %s", article.title, article.url)
                 continue
-            self.notifier.send(article)
+            complete_html = self.freshdesk.get_complete_html(article)
+            html_file_url = self.drive_uploader.upload_article_html(
+                article, complete_html
+            )
+            self.notifier.send(article, html_file_url)
             LOGGER.info("Alert sent: %s — %s", article.title, article.url)
             known.add(article.id)
             state.update(
@@ -373,14 +542,15 @@ def main() -> int:
     )
     try:
         if args.test_message:
-            config = Config.from_env(require_freshdesk=False)
+            config = Config.from_env(require_freshdesk=False, require_drive=False)
             GoogleChatNotifier(config.google_chat_webhook_url).send(
                 Article(
                     id=123456789,
                     title="Test article alert from KBAgent",
                     created_at="",
                     url=f"{config.public_portal_url}/support/solutions",
-                )
+                ),
+                "https://drive.google.com/",
             )
             LOGGER.info("Google Chat test message sent.")
             return 0
@@ -389,6 +559,10 @@ def main() -> int:
         service = ArticleAlertService(
             config,
             FreshdeskClient(config),
+            GoogleDriveUploader(
+                config.google_service_account_json,
+                config.google_drive_folder_id,
+            ),
             GoogleChatNotifier(config.google_chat_webhook_url),
             StateStore(config.state_path),
         )
