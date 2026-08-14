@@ -245,13 +245,8 @@ class FreshdeskClient:
         detail = self._get_object(f"/api/v2/solutions/articles/{article.id}")
         title = str(detail.get("title") or article.title).strip()
         article_body = str(detail.get("description") or "")
-        created_at = str(detail.get("created_at") or article.created_at)
-        updated_at = str(detail.get("updated_at") or article.updated_at)
         safe_title = html.escape(title)
-        safe_url = html.escape(article.url, quote=True)
         safe_base_url = html.escape(f"{self.config.public_portal_url}/", quote=True)
-        safe_created_at = html.escape(created_at)
-        safe_updated_at = html.escape(updated_at)
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -263,7 +258,6 @@ class FreshdeskClient:
     body {{ color: #202124; font: 16px/1.6 Arial, sans-serif; margin: 0; }}
     main {{ margin: 40px auto; max-width: 960px; padding: 0 24px 48px; }}
     h1 {{ line-height: 1.25; }}
-    .metadata {{ color: #5f6368; font-size: 13px; margin-bottom: 32px; }}
     img {{ height: auto; max-width: 100%; }}
     pre {{ overflow-x: auto; }}
     table {{ border-collapse: collapse; max-width: 100%; }}
@@ -273,12 +267,6 @@ class FreshdeskClient:
 <body>
   <main>
     <article>
-      <h1>{safe_title}</h1>
-      <p class="metadata">
-        Created: {safe_created_at}<br>
-        Updated: {safe_updated_at}<br>
-        Source: <a href="{safe_url}">{safe_url}</a>
-      </p>
       <div class="article-body">
 {article_body}
       </div>

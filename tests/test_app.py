@@ -8,6 +8,7 @@ from app import (
     Article,
     ArticleAlertService,
     Config,
+    FreshdeskClient,
     GoogleChatNotifier,
     GoogleDriveUploader,
     StateStore,
@@ -147,6 +148,25 @@ class ArticleAlertServiceTests(unittest.TestCase):
             filename,
             "How to use Flights Hotels - 2026-01-02_03-04-05_UTC.html",
         )
+
+    def test_complete_html_contains_body_without_visible_metadata_header(self):
+        client = FreshdeskClient.__new__(FreshdeskClient)
+        client.config = config(self.state_path)
+        client._get_object = lambda path: {
+            "title": "Alert test",
+            "description": "<p>Complete Freshdesk body</p>",
+            "created_at": "2026-07-29T18:13:12Z",
+            "updated_at": "2026-07-29T18:13:12Z",
+        }
+
+        document = client.get_complete_html(self.old)
+
+        self.assertIn("<title>Alert test</title>", document)
+        self.assertIn("<p>Complete Freshdesk body</p>", document)
+        self.assertNotIn("<h1>Alert test</h1>", document)
+        self.assertNotIn("Created:", document)
+        self.assertNotIn("Updated:", document)
+        self.assertNotIn("Source:", document)
 
 
 if __name__ == "__main__":
